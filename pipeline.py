@@ -30,7 +30,7 @@ from dotenv import load_dotenv
 warnings.filterwarnings("ignore")
 
 # ─── Paths ───────────────────────────────────────────────────
-BASE_DIR        = Path(r"C:\Users\Parth Chauhan\Desktop\RAG_Project")
+BASE_DIR        = Path(__file__).resolve().parent
 DATA_DIR        = BASE_DIR / "Data"
 OUTPUT_DIR      = BASE_DIR / "outputs"
 NOTEBOOKS_DIR   = BASE_DIR / "notebooks"
@@ -101,6 +101,8 @@ OUTPUT_COLUMNS = [
 ]
 
 
+RAW_TEXTS_CACHE = OUTPUT_DIR / "raw_texts_cache.json"
+
 # ════════════════════════════════════════════════════════════════
 # STAGE 1 — PDF INGESTION
 # ════════════════════════════════════════════════════════════════
@@ -145,6 +147,15 @@ def stage1_ingest_pdfs() -> dict:
     print("STAGE 1 — PDF Ingestion")
     print("="*60)
 
+    if RAW_TEXTS_CACHE.exists():
+        try:
+            raw_texts = json.loads(RAW_TEXTS_CACHE.read_text(encoding="utf-8"))
+            raw_texts = {k: v.replace("\r\n", "\n") for k, v in raw_texts.items()}
+            print(f"  Loaded {len(raw_texts)} ingested PDFs from raw_texts_cache.json (cached)")
+            return raw_texts
+        except Exception:
+            pass
+
     pdf_files = sorted(DATA_DIR.glob("*.pdf"))
     print(f"Found {len(pdf_files)} PDFs in {DATA_DIR}")
 
@@ -166,15 +177,23 @@ def stage1_ingest_pdfs() -> dict:
             text = ""
             print(f"  WARNING: Very short/empty extraction for {fname}")
 
-        raw_texts[fname] = text
+        raw_texts[fname] = text.replace("\r\n", "\n")
 
     if errors:
         ERROR_LOG.write_text("\n".join(errors), encoding="utf-8")
         print(f"\n  {len(errors)} PDFs had extraction issues -> {ERROR_LOG}")
 
+    # Save to cache
+    try:
+        RAW_TEXTS_CACHE.write_text(json.dumps(raw_texts, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"  Saved {len(raw_texts)} ingested PDFs to raw_texts_cache.json")
+    except Exception as e:
+        print(f"  WARNING: Could not save ingestion cache: {e}")
+
     ok = len(raw_texts) - len(errors)
     print(f"\n  Stage 1 complete: {ok}/{len(pdf_files)} PDFs extracted cleanly")
     return raw_texts
+
 
 
 # ════════════════════════════════════════════════════════════════
@@ -341,7 +360,8 @@ def _save_cache():
     )
 
 def _cache_key(model: str, prompt: str) -> str:
-    h = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:20]
+    normalized = prompt.replace("\r\n", "\n")
+    h = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:20]
     return f"{model}::{h}"
 
 
@@ -374,17 +394,26 @@ def call_groq(prompt: str, model: str = None, is_retry: bool = False) -> tuple[s
     if used >= limit * 0.85:
         print(f"\n  WARNING: {model} at {used}/{limit} RPD ({100*used/limit:.0f}%)")
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-    )
-    result = response.choices[0].message.content
-    _cache[key] = result
-    _save_cache()
-    _call_counts[model] += 1
-    time.sleep(0.5)   # stay within rate limits
-    return result, False
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        result = response.choices[0].message.content
+        _cache[key] = result
+        _save_cache()
+        _call_counts[model] += 1
+        time.sleep(0.5)   # stay within rate limits
+        return result, False
+    except Exception as e:
+        err_msg = str(e)
+        if "429" in err_msg or "rate limit" in err_msg.lower() or "limit reached" in err_msg.lower() or "rate_limit_exceeded" in err_msg:
+            if model == MODEL_STRONG:
+                print(f"\n  [Rate Limit fallback] {MODEL_STRONG} rate limited. Retrying with {MODEL_FAST}...")
+                return call_groq(prompt, model=MODEL_FAST, is_retry=is_retry)
+        raise e
+
 
 
 # ── Extraction prompt ────────────────────────────────────────
@@ -396,18 +425,18 @@ Extract clinical parameters for drug brand {BRAND} (indication: Plaque Psoriasis
 Return ONLY a valid JSON object with EXACTLY these keys (no extra keys, no markdown fences):
 
 {{
-  "age": "Minimum age eligibility. Format: '>= X' (e.g., '>= 18', '>= 6'). Default '>= 18' if not stated.",
-  "step_therapy_requirements": "Full description of ALL step therapy agents (conventional AND biologic) required before {BRAND} approval for PsO. Include agent names, count, AND trial duration. Example: '1 conventional systemic (methotrexate, cyclosporine, or acitretin) for >= 3 months AND trial and failure of 1 biologic'. Write 'None required' if no step therapy.",
+  "age": "Minimum age eligibility. Format: '>= X' (e.g., '>= 18', '>= 6'). If the policy does not specify a numerical threshold but references FDA labeled age or does not specify the actual age but just what it is indicated for, write 'FDA labelled age'. If the policy lists requirements for multiple age groups, capture the youngest one.",
+  "step_therapy_requirements": "Full description of ALL step therapy language from the policy, covering both indication/brand-specific steps and any universal criteria (criteria that apply across all indications). Phototherapy language must be included here if it appears within step statements. If the policy distinguishes between moderate-to-severe and severe PsO, capture ONLY moderate-to-severe criteria. Write 'None required' if no step therapy.",
   "num_steps_biologic": 0,
   "num_steps_conventional": 0,
-  "phototherapy_required": "Yes or No — is phototherapy explicitly a required step therapy option?",
+  "phototherapy_required": "Yes, No, or N/A. 'Yes' if phototherapy (including PUVA) is a mandatory required step in the combined criteria and is NOT in an OR statement. 'No' if not mentioned, or if phototherapy is only an option in an OR statement (e.g., 'phototherapy OR methotrexate'). 'N/A' if the policy lists no criteria at all (e.g., if the drug is excluded).",
   "tb_test_required": "Yes or No ONLY. Yes if TB test is explicitly required OR referenced via prescribing information (e.g., 'per prescribing information').",
-  "quantity_limits": "Any quantity/supply limits stated (e.g., '1 syringe per 56 days'). Write 'Per FDA label' if not stated.",
+  "quantity_limits": "Any quantity/supply limits explicitly stated as a 'quantity limit' (e.g., '1 syringe per 56 days'). Do NOT capture if explicitly stated as 'dosage', 'dosing', 'dosing limit', or 'administration frequency' (e.g., do NOT capture '45 mg at weeks 0, 4, then every 12 weeks'). Write 'Per FDA label' if no explicit quantity limit is stated.",
   "specialist_types": "Who can prescribe (e.g., 'Dermatologist', 'Dermatologist or Rheumatologist', 'No restriction'). Write 'Not specified' if not mentioned.",
-  "initial_auth_duration_months": "Initial approval period as a number of months only (e.g., 6, 12). Write 'Not specified' if not stated.",
-  "reauth_duration_months": "Renewal period as a number of months only (e.g., 12). Write 'Same as initial' if same. Write 'Not specified' if not stated.",
+  "initial_auth_duration_months": "Initial approval period as a number of months only (e.g., 6, 12). Write 'Unspecified' if not stated.",
+  "reauth_duration_months": "Renewal period as a number of months only (e.g., 12). Write 'Same as initial' if same. Write 'Unspecified' if not stated.",
   "reauth_required": "Yes or No — is reauthorization required?",
-  "reauth_clinical_criteria": "Key clinical criteria for renewal (e.g., 'Documentation of positive clinical response evidenced by reduction in BSA or improvement in symptoms'). Write 'Not specified' if not stated.",
+  "reauth_clinical_criteria": "Key clinical criteria for renewal (e.g., 'Documentation of positive clinical response evidenced by reduction in BSA or improvement in symptoms'). Write 'Unspecified' if not stated.",
   "confidence": "Your extraction confidence: High, Medium, or Low",
   "exclusion_flag": false
 }}
@@ -423,6 +452,7 @@ Critical rules:
 
 Policy text (brand: {BRAND}):
 {TEXT}"""
+
 
 
 def parse_json_response(raw: str) -> dict | None:
@@ -454,13 +484,14 @@ FAILED_PARAMS = {
     "tb_test_required": "No",
     "quantity_limits": "Per FDA label",
     "specialist_types": "Not specified",
-    "initial_auth_duration_months": "Not specified",
-    "reauth_duration_months": "Not specified",
+    "initial_auth_duration_months": "Unspecified",
+    "reauth_duration_months": "Unspecified",
     "reauth_required": "No",
-    "reauth_clinical_criteria": "Not specified",
+    "reauth_clinical_criteria": "Unspecified",
     "confidence": "Low",
     "exclusion_flag": False,
 }
+
 
 
 def extract_parameters(fname: str, brand: str, text: str) -> dict:
@@ -687,47 +718,121 @@ def assemble_dataframe(jobs: list, extracted: dict, scores: dict) -> pd.DataFram
         params = extracted.get((fname, brand), FAILED_PARAMS)
         score, _ = scores.get((fname, brand), (0, {}))
 
-        # Reauth duration display
-        reauth_raw = str(params.get("reauth_duration_months", "Not specified"))
+        # 1. Age
+        age_val = params.get("age", "FDA labelled age")
+        if not age_val or str(age_val).strip() in {"", "None", "nan", "Not specified", "Unspecified"}:
+            age_val = "FDA labelled age"
+
+        # 2. Step therapy description
+        step_req = params.get("step_therapy_requirements", "Unspecified")
+        if not step_req or str(step_req).strip() in {"", "None", "nan", "Not specified"}:
+            step_req = "Unspecified"
+
+        # 3. Number of Steps through Brands
+        num_brands = params.get("num_steps_biologic", 0)
+        try:
+            num_brands_val = int(num_brands)
+        except (ValueError, TypeError):
+            num_brands_val = 0
+        num_brands_display = "NA" if num_brands_val == 0 else num_brands_val
+
+        # 4. Number of Steps through Generic
+        num_generics = params.get("num_steps_conventional", 0)
+        try:
+            num_generics_val = int(num_generics)
+        except (ValueError, TypeError):
+            num_generics_val = 0
+        num_generics_display = "NA" if num_generics_val == 0 else num_generics_val
+
+        # 5. Step through-Phototherapy
+        photo = str(params.get("phototherapy_required", "No")).strip()
+        if photo.lower() in {"yes", "y"}:
+            photo_display = "Yes"
+        elif photo.lower() in {"no", "n"}:
+            photo_display = "No"
+        else:
+            photo_display = "N/A"
+
+        # 6. TB Test required
+        tb = str(params.get("tb_test_required", "No")).strip()
+        tb_display = "Yes" if tb.lower() in {"yes", "y", "true"} else "No"
+
+        # 7. Quantity Limits (Filter dosage/dosing schedules)
+        def clean_qty_limit(val):
+            s = str(val).strip()
+            s_lower = s.lower()
+            if any(x in s_lower for x in ["per fda label", "fda label", "not specified", "unspecified", "none"]):
+                return "Per FDA label"
+            # Filter out dosing schedules like '45 mg at weeks 0, 4' if not explicitly quantity limited
+            if any(d in s_lower for d in ["mg per dose", "dose limit", "maintenance dose", "dosing is", "dosing:", "mg at weeks", "mg every"]):
+                if not any(q in s_lower for q in ["syringe", "vial", "pack", "qty", "limit", "limit:", "max", "maximum", "quantity level limit"]):
+                    return "Per FDA label"
+            return s
+        qty_display = clean_qty_limit(params.get("quantity_limits", "Per FDA label"))
+
+        # 8. Specialist Types
+        spec_display = params.get("specialist_types", "Not specified")
+        if not spec_display or str(spec_display).strip() in {"", "None", "nan"}:
+            spec_display = "Not specified"
+
+        # 9. Initial Authorization Duration(in-months)
+        init_raw = params.get("initial_auth_duration_months", "Unspecified")
+        im = parse_months(str(init_raw))
+        if im and im == int(im):
+            init_display = f"{int(im)} Months"
+        elif im:
+            init_display = f"{im:.1f} Months"
+        else:
+            init_display = "Unspecified"
+
+        # 10. Reauthorization Duration(in-months)
+        reauth_raw = str(params.get("reauth_duration_months", "Unspecified"))
         if "same as initial" in reauth_raw.lower():
-            reauth_display = reauth_raw
+            reauth_display = "Same as initial"
         else:
             rm = parse_months(reauth_raw)
-            reauth_display = f"{int(rm)} months" if rm and rm == int(rm) else (f"{rm:.1f} months" if rm else reauth_raw)
+            if rm and rm == int(rm):
+                reauth_display = f"{int(rm)} Months"
+            elif rm:
+                reauth_display = f"{rm:.1f} Months"
+            else:
+                reauth_display = "Unspecified"
 
-        # Initial auth display
-        init_raw = params.get("initial_auth_duration_months", "Not specified")
-        im = parse_months(str(init_raw))
-        init_display = f"{int(im)} months" if im and im == int(im) else (f"{im:.1f} months" if im else str(init_raw))
+        # 11. Reauthorization Requirements Documented in Policy
+        reauth_crit_display = params.get("reauth_clinical_criteria", "Unspecified")
+        if not reauth_crit_display or str(reauth_crit_display).strip() in {"", "None", "nan", "Not specified"}:
+            reauth_crit_display = "Unspecified"
+
+        # 12. Reauthorization Required (Programmatic override if duration or criteria is non-NA)
+        reauth_req = str(params.get("reauth_required", "No")).strip().lower()
+        reauth_req_display = "Yes" if reauth_req in {"yes", "y", "true"} else "No"
+        
+        has_reauth_dur = reauth_display.lower() not in {"unspecified", "not specified", "n/a", "na", "", "none"}
+        has_reauth_crit = reauth_crit_display.lower() not in {"unspecified", "not specified", "n/a", "na", "", "none", "failed"}
+        
+        if has_reauth_dur or has_reauth_crit:
+            reauth_req_display = "Yes"
 
         rows.append({
             "Filename":   fname,
             "Brand":      brand,
-            "Age":        params.get("age", ">= 18"),
-            "Step Therapy Requirements Documented in Policy":
-                params.get("step_therapy_requirements", "Not specified"),
-            "Number of Steps through Brands":
-                params.get("num_steps_biologic", 0),
-            "Number of Steps through Generic":
-                params.get("num_steps_conventional", 0),
-            "Step through-Phototherapy":
-                params.get("phototherapy_required", "No"),
-            "TB Test required":
-                params.get("tb_test_required", "No"),
-            "Quantity Limits":
-                params.get("quantity_limits", "Per FDA label"),
-            "Specialist Types":
-                params.get("specialist_types", "Not specified"),
+            "Age":        age_val,
+            "Step Therapy Requirements Documented in Policy": step_req,
+            "Number of Steps through Brands":  num_brands_display,
+            "Number of Steps through Generic": num_generics_display,
+            "Step through-Phototherapy":       photo_display,
+            "TB Test required":                tb_display,
+            "Quantity Limits":                 qty_display,
+            "Specialist Types":                spec_display,
             "Initial Authorization Duration(in-months)": init_display,
             "Reauthorization Duration(in-months)":       reauth_display,
-            "Reauthorization Required":
-                params.get("reauth_required", "Yes"),
-            "Reauthorization Requirements Documented in Policy":
-                params.get("reauth_clinical_criteria", "Not specified"),
+            "Reauthorization Required":                  reauth_req_display,
+            "Reauthorization Requirements Documented in Policy": reauth_crit_display,
             "Access Score": score,
         })
 
     return pd.DataFrame(rows, columns=OUTPUT_COLUMNS)
+
 
 
 def validate_dataframe(df: pd.DataFrame, jobs: list) -> bool:

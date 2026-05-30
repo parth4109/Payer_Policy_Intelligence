@@ -125,4 +125,4 @@ The pipeline is fully reproducible end-to-end:
 - No manual steps required
 - Deterministic scoring (temperature=0 for all LLM calls)
 - Disk-cached responses for identical re-runs
-- All paths relative to `BASE_DIR = C:\Users\Parth Chauhan\Desktop\RAG_Project`
+- All paths relative to `BASE_DIR = Path(__file__).resolve().parent` (the project root folder)
