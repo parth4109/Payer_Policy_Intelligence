@@ -147,23 +147,33 @@ def stage1_ingest_pdfs() -> dict:
     print("STAGE 1 — PDF Ingestion")
     print("="*60)
 
-    if RAW_TEXTS_CACHE.exists():
-        try:
-            raw_texts = json.loads(RAW_TEXTS_CACHE.read_text(encoding="utf-8"))
-            raw_texts = {k: v.replace("\r\n", "\n") for k, v in raw_texts.items()}
-            print(f"  Loaded {len(raw_texts)} ingested PDFs from raw_texts_cache.json (cached)")
-            return raw_texts
-        except Exception:
-            pass
-
     pdf_files = sorted(DATA_DIR.glob("*.pdf"))
+    pdf_names = {f.name for f in pdf_files}
     print(f"Found {len(pdf_files)} PDFs in {DATA_DIR}")
 
     raw_texts = {}
     errors = []
+    
+    if RAW_TEXTS_CACHE.exists():
+        try:
+            cached_texts = json.loads(RAW_TEXTS_CACHE.read_text(encoding="utf-8"))
+            cached_texts = {k: v.replace("\r\n", "\n") for k, v in cached_texts.items()}
+            
+            # Check if all actual PDFs exist in cache
+            if all(name in cached_texts for name in pdf_names):
+                print(f"  Loaded all {len(pdf_names)} ingested PDFs from raw_texts_cache.json (cached)")
+                return {name: cached_texts[name] for name in pdf_names}
+            
+            # We have new files! Load existing cache first, then parse missing files
+            raw_texts = {name: cached_texts[name] for name in pdf_names if name in cached_texts}
+            print(f"  Loaded {len(raw_texts)} PDFs from raw_texts_cache.json (cached), need to ingest missing ones.")
+        except Exception:
+            raw_texts = {}
 
     for pdf_path in tqdm(pdf_files, desc="  Ingesting"):
         fname = pdf_path.name
+        if fname in raw_texts:
+            continue
 
         # Primary: pdfplumber
         text = extract_text_pdfplumber(pdf_path)
@@ -298,19 +308,52 @@ def segment_text_for_brand(full_text: str, brand: str, max_chars: int = 9000) ->
 def stage2_build_jobs(raw_texts: dict) -> list[tuple[str, str, str]]:
     """
     Stage 2: Load job list from Submissions sheet and segment text per brand.
-    Returns jobs: [(filename, brand, text_segment), ...]
+    Also automatically detects brands for any new PDFs in the Data/ folder
+    that are not listed in the Submissions sheet.
     """
     print("\n" + "="*60)
     print("STAGE 2 — Brand Detection & Job Segmentation")
     print("="*60)
 
-    jobs_raw = load_jobs_from_submissions()
-    print(f"  Loaded {len(jobs_raw)} (Filename, Brand) pairs from Submissions sheet")
+    # 1. Load explicit jobs from the Submissions sheet (ground truth template)
+    try:
+        jobs_raw = load_jobs_from_submissions()
+        print(f"  Loaded {len(jobs_raw)} (Filename, Brand) pairs from Submissions sheet")
+    except Exception as e:
+        print(f"  WARNING: Could not load Submissions sheet: {e}. Running in pure auto-detect mode.")
+        jobs_raw = []
+
+    # Map for quick lookup of existing filename -> set of brands
+    existing_jobs = {}
+    for fname, brand in jobs_raw:
+        existing_jobs.setdefault(fname, set()).add(brand)
+
+    # 2. Check for any new PDFs in raw_texts that are not in the submissions sheet
+    new_jobs = []
+    for fname, text in raw_texts.items():
+        if fname not in existing_jobs:
+            detected_brands = []
+            text_lower = text.lower()
+            for brand, keywords in BRAND_KEYWORDS.items():
+                if any(kw.lower() in text_lower for kw in keywords):
+                    detected_brands.append(brand)
+            
+            if detected_brands:
+                print(f"  Auto-detected new PDF '{fname}' containing brand(s): {detected_brands}")
+                for brand in detected_brands:
+                    new_jobs.append((fname, brand))
+            else:
+                print(f"  WARNING: New PDF '{fname}' has no detected brand keywords.")
+
+    # Combine explicit and auto-detected jobs
+    all_jobs_raw = jobs_raw + new_jobs
+    if new_jobs:
+        print(f"  Added {len(new_jobs)} auto-detected jobs for new PDFs. Total raw jobs: {len(all_jobs_raw)}")
 
     jobs = []
     missing_pdfs = []
 
-    for fname, brand in jobs_raw:
+    for fname, brand in all_jobs_raw:
         if fname not in raw_texts:
             print(f"  WARNING: PDF not found in raw_texts: {fname}")
             missing_pdfs.append((fname, brand))
@@ -322,7 +365,7 @@ def stage2_build_jobs(raw_texts: dict) -> list[tuple[str, str, str]]:
         jobs.append((fname, brand, segment))
 
     if missing_pdfs:
-        print(f"\n  {len(missing_pdfs)} PDFs referenced in Submissions but not found in Data/")
+        print(f"\n  {len(missing_pdfs)} PDFs referenced in jobs but not found in Data/")
 
     # Print brand distribution
     brand_counts = {}
@@ -755,7 +798,7 @@ def assemble_dataframe(jobs: list, extracted: dict, scores: dict) -> pd.DataFram
 
         # 6. TB Test required
         tb = str(params.get("tb_test_required", "No")).strip()
-        tb_display = "Yes" if tb.lower() in {"yes", "y", "true"} else "No"
+        tb_display = "Y" if tb.lower() in {"yes", "y", "true"} else "N"
 
         # 7. Quantity Limits (Filter dosage/dosing schedules)
         def clean_qty_limit(val):
